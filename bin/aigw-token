@@ -5,6 +5,7 @@
 #   aigw-token login      device flow only: show the sign-in URL and wait for approval
 #   aigw-token logout     revoke the refresh token at the IdP and delete the local cache
 #   aigw-token status     show the cached token's claims and expiry (never the token itself)
+#   aigw-token config     print the gateway config the token names (claim defaults.config_id)
 #
 # Config (environment):
 #   AIGW_AUTH_MODE            device | client-credentials
@@ -17,6 +18,9 @@
 #   AIGW_RETRY_WINDOW         a re-run within this many seconds of handing out a token means the gateway rejected it
 #                             (Claude Code re-runs the helper on 401/403): get a new one instead (default 5)
 #   AIGW_TOKEN_LOG            optional file: one line per run (what it did, never a token)
+#   AIGW_CLAUDE_SETTINGS      optional Claude Code settings file (e.g. ~/.claude/settings.json): keep its
+#                             env.ANTHROPIC_CUSTOM_HEADERS x-portkey-config line equal to the token's defaults.config_id
+#   AIGW_SETTINGS_SETTLE      seconds to wait after changing that file, so Claude Code reloads it first (default 3)
 #
 # Only the token goes to stdout. Messages go to stderr; Claude Code shows a failing helper's stderr in the session,
 # which is how the device-flow sign-in URL reaches the user.
@@ -146,6 +150,31 @@ device_token() {  # non-blocking, for apiKeyHelper: refresh, else finish or star
   exit 1
 }
 
+# --- Claude Code config from the token --------------------------------------------------------------------------------
+config_id() { [ -f "$TOKENS" ] && jwt_claims "$(jq -r .access_token "$TOKENS")" | jq -r '.defaults.config_id // empty'; }
+
+sync_claude_settings() {  # set x-portkey-config in the Claude Code settings file to the token's config; never fatal
+  local file=${AIGW_CLAUDE_SETTINGS:-} cfg headers new
+  [ -n "$file" ] || return 0
+  case $file in "~/"*) file="$HOME/${file#\~/}" ;; esac
+  cfg=$(config_id 2>/dev/null) || cfg=""
+  [ -n "$cfg" ] || return 0
+  case $cfg in *[!A-Za-z0-9_-]*) log "ignoring config id with unexpected characters"; return 0 ;; esac
+  [ -f "$file" ] || echo '{}' >"$file" || return 0
+  headers=$(jq -r '.env.ANTHROPIC_CUSTOM_HEADERS // ""' "$file" 2>/dev/null) || { log "can't parse $file"; return 0; }
+  # replace (or add, first) the x-portkey-config line; keep every other header
+  new=$( { printf 'x-portkey-config: %s\n' "$cfg"; printf '%s\n' "$headers" | grep -v -i -e '^x-portkey-config:' -e '^$'; } || true)
+  [ "$new" != "$headers" ] || return 0
+  if jq --arg h "$new" '.env.ANTHROPIC_CUSTOM_HEADERS = $h' "$file" >"$file.aigw.tmp" 2>/dev/null &&
+     cat "$file.aigw.tmp" >"$file" 2>/dev/null; then   # cat, not mv: keeps the file's owner, mode and links
+    log "set x-portkey-config: $cfg in $file"
+    sleep "${AIGW_SETTINGS_SETTLE:-3}"   # let Claude Code reload its settings before it sends the request
+  else
+    log "can't update $file"
+  fi
+  rm -f "$file.aigw.tmp"
+}
+
 # --- commands --------------------------------------------------------------------------------------------------------
 cmd_token() {
   if [ -f "$SERVED" ] && [ -f "$TOKENS" ] && [ $(( NOW - $(mtime "$SERVED") )) -lt "$RETRY_WINDOW" ]; then
@@ -160,18 +189,19 @@ cmd_token() {
     esac
   fi
   touch "$SERVED"
+  sync_claude_settings
 }
 
 cmd_login() {
   [ "$AIGW_AUTH_MODE" = device ] || die "login is only for AIGW_AUTH_MODE=device"
-  { cached || refresh; } >/dev/null && { echo "Already signed in." >&2; return; }
+  { cached || refresh; } >/dev/null && { echo "Already signed in." >&2; sync_claude_settings; return; }
   local rc=0; device_poll >/dev/null || rc=$?
-  [ $rc -eq 0 ] && { echo "Signed in." >&2; return; }
+  [ $rc -eq 0 ] && { echo "Signed in." >&2; sync_claude_settings; return; }
   [ $rc -eq 2 ] || device_start
   device_prompt
   while [ "$(jq -r .expires_at "$PENDING" 2>/dev/null || echo 0)" -gt "$(date +%s)" ]; do
     NOW=$(date +%s); rc=0; device_poll >/dev/null || rc=$?   # device_poll waits out the poll interval
-    case $rc in 0) echo "Signed in." >&2; return ;; 1) die "sign-in was denied or expired" ;; esac
+    case $rc in 0) echo "Signed in." >&2; sync_claude_settings; return ;; 1) die "sign-in was denied or expired" ;; esac
   done
   die "sign-in timed out"
 }
@@ -201,5 +231,6 @@ case ${1:-token} in
   login) cmd_login ;;
   logout) cmd_logout ;;
   status) cmd_status ;;
-  *) echo "usage: aigw-token [token|login|logout|status]" >&2; exit 2 ;;
+  config) cached >/dev/null || cmd_token >/dev/null; config_id ;;
+  *) echo "usage: aigw-token [token|login|logout|status|config]" >&2; exit 2 ;;
 esac
