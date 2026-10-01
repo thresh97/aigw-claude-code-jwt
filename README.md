@@ -9,16 +9,7 @@ Claude Code through a **hybrid** Prisma AIRS / Portkey AI Gateway, authenticated
 
 > **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
 
-```
-                  ┌──────────── IdP (OIDC) ────────────┐
-                  │ device flow / refresh token        │ JWKS (public keys)
-                  │ or client credentials              │
-                  ▼                                    ▼
-Claude Code ── apiKeyHelper ── bin/aigw-token     AI Gateway (hybrid, JWT_ENABLED=ON) ──► provider (here Vertex AI)
-     │          prints a JWT (cached, renewed)         ▲  verifies signature + exp locally,
-     └── Authorization: Bearer <JWT>  ─────────────────┘  org/workspace/scopes from claims or gateway settings
-         x-portkey-config: <slug>  ◄── the JWT's defaults.config_id, copied into Claude Code's settings by the helper
-```
+![Claude Code runs bin/aigw-token as its apiKeyHelper. The helper gets a short-lived JWT from the IdP (device flow and refresh token, or client credentials), prints it for Claude Code and copies the token's defaults.config_id claim into Claude Code's settings as x-portkey-config. Claude Code sends the JWT as a Bearer token with that header to the hybrid AI Gateway, which checks the signature against the IdP's JWKS and the expiry locally, then calls the model provider.](flow.svg)
 
 The gateway never talks to the IdP for a request. It checks the JWT's signature against the org's JWKS and its `exp`, so a token is good until it expires. Short tokens (minutes) and a helper that renews them are what make that safe.
 

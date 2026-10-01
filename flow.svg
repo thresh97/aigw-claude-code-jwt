@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 470" width="1024" height="470" role="img"
+     aria-labelledby="title desc">
+  <title id="title">Claude Code to a hybrid AI Gateway with IdP JWTs</title>
+  <desc id="desc">Claude Code runs bin/aigw-token as its apiKeyHelper. The helper gets a short-lived JWT from the IdP with
+    the device flow and a refresh token, or with client credentials, prints it for Claude Code, and copies the token's
+    defaults.config_id claim into Claude Code's settings as the x-portkey-config header. Claude Code sends the JWT as a
+    Bearer token with that header to the hybrid AI Gateway, which checks the signature against the IdP's JWKS and the
+    expiry locally, then calls the model provider.</desc>
+  <style>
+    .card { fill: #ffffff; stroke: #d0d7de; }
+    .cred { fill: #fff8e5; stroke: #d4a72c; }
+    .call { fill: #eef4ff; stroke: #5b8def; }
+    .out  { fill: #eaf7ee; stroke: #3fa55b; }
+    .chip { fill: #f6f8fa; stroke: #d0d7de; }
+    .box  { stroke-width: 1.5; }
+    text  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, "DejaVu Sans", sans-serif; fill: #1f2328; }
+    .h    { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; fill: #59636e; }
+    .t    { font-size: 15px; font-weight: 600; }
+    .s    { font-size: 12.5px; fill: #59636e; }
+    .m    { font-family: 'DejaVu Sans Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+    .edge { fill: none; stroke: #6e7781; stroke-width: 1.6; }
+    .dash { stroke-dasharray: 6 5; }
+    .head { fill: #6e7781; }
+    .l    { font-size: 12px; fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: #0d1117; stroke: #30363d; }
+      .cred { fill: #2b2111; stroke: #9e7a1f; }
+      .call { fill: #0f1b33; stroke: #4a7bd0; }
+      .out  { fill: #0f2417; stroke: #2f8a4a; }
+      .chip { fill: #161b22; stroke: #30363d; }
+      text  { fill: #e6edf3; }
+      .h, .s, .l { fill: #9198a1; }
+      .edge { stroke: #8b949e; }
+      .head { fill: #8b949e; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="card" x="0.5" y="0.5" width="1023" height="469" rx="12"/>
+
+  <text class="h" x="24" y="32">CLIENT</text>
+  <text class="h" x="470" y="32">IDENTITY AND GATEWAY</text>
+  <text class="h" x="810" y="32">PROVIDER</text>
+
+  <!-- helper -->
+  <rect class="box cred" x="24" y="48" width="260" height="84" rx="8"/>
+  <text class="t" x="40" y="75">bin/aigw-token</text>
+  <text class="s" x="40" y="96">device flow + refresh token,</text>
+  <text class="s" x="40" y="114">or client credentials; cached</text>
+
+  <!-- IdP -->
+  <rect class="box cred" x="470" y="48" width="260" height="84" rx="8"/>
+  <text class="t" x="486" y="75">IdP (OIDC)</text>
+  <text class="s" x="486" y="96">Keycloak, Okta, Entra ID, …</text>
+  <text class="m" x="486" y="116">JWT: exp, kid, defaults.config_id</text>
+
+  <path class="edge" d="M284,78 H468" marker-end="url(#arrow)"/>
+  <text class="l" x="300" y="70">token request</text>
+  <path class="edge" d="M470,104 H286" marker-end="url(#arrow)"/>
+  <text class="l" x="300" y="122">JWT (minutes)</text>
+
+  <!-- Claude Code -->
+  <rect class="box call" x="24" y="300" width="260" height="118" rx="8"/>
+  <text class="t" x="40" y="327">Claude Code</text>
+  <text class="m" x="40" y="347">apiKeyHelper = bin/aigw-token</text>
+  <rect class="box chip" x="40" y="360" width="228" height="44" rx="6"/>
+  <text class="m" x="52" y="378">settings.json</text>
+  <text class="m" x="52" y="394">x-portkey-config: &lt;slug&gt;</text>
+
+  <path class="edge" d="M70,132 V298" marker-end="url(#arrow)"/>
+  <text class="l" x="80" y="210">JWT on stdout</text>
+  <text class="l" x="80" y="226">re-run on 401/403,</text>
+  <text class="l" x="80" y="242">expiry, every 5 min</text>
+  <path class="edge" d="M254,132 V358" marker-end="url(#arrow)"/>
+  <text class="l" x="264" y="210">writes x-portkey-config</text>
+  <text class="l" x="264" y="226">from defaults.config_id</text>
+
+  <!-- gateway -->
+  <rect class="box call" x="470" y="300" width="260" height="118" rx="8"/>
+  <text class="t" x="486" y="327">AI Gateway (hybrid)</text>
+  <text class="m" x="486" y="347">JWT_ENABLED=ON</text>
+  <text class="s" x="486" y="370">checks signature + exp locally;</text>
+  <text class="s" x="486" y="388">org and workspace from claims</text>
+  <text class="s" x="486" y="406">or gateway settings</text>
+
+  <path class="edge dash" d="M600,132 V298" marker-end="url(#arrow)"/>
+  <text class="l" x="610" y="210">JWKS (public keys)</text>
+  <text class="l" x="610" y="226">no IdP call per request</text>
+
+  <path class="edge" d="M284,340 H468" marker-end="url(#arrow)"/>
+  <text class="m" x="296" y="332">Bearer &lt;JWT&gt;</text>
+  <text class="m" x="296" y="358">x-portkey-config</text>
+
+  <!-- provider -->
+  <rect class="box out" x="810" y="318" width="190" height="72" rx="8"/>
+  <text class="t" x="826" y="345">Model provider</text>
+  <text class="s" x="826" y="366">here Vertex AI</text>
+  <path class="edge" d="M730,354 H808" marker-end="url(#arrow)"/>
+
+  <text class="l" x="24" y="450">Change the claim at the IdP and the helper rewrites the header at the next token renewal.</text>
+</svg>
