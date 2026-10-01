@@ -11,6 +11,14 @@ Claude Code through a **hybrid** Prisma AIRS / Portkey AI Gateway, authenticated
 
 ![Claude Code runs bin/aigw-token as its apiKeyHelper. The helper gets a short-lived JWT from the IdP (device flow and refresh token, or client credentials), prints it for Claude Code and copies the token's defaults.config_id claim into Claude Code's settings as x-portkey-config. Claude Code sends the JWT as a Bearer token with that header to the hybrid AI Gateway, which checks the signature against the IdP's JWKS and the expiry locally, then calls the model provider.](flow.svg)
 
+1. `bin/aigw-token` asks the IdP for a token: device flow and refresh token (per user) or client credentials (shared).
+2. The IdP returns a JWT that lives for minutes, with a `defaults.config_id` claim.
+3. The helper prints the JWT; Claude Code sends it as the API key. Claude Code re-runs the helper on `401`/`403`, on JWT expiry and every 5 minutes.
+4. The helper writes `x-portkey-config: <defaults.config_id>` into Claude Code's settings.
+5. Claude Code calls the gateway with `Authorization: Bearer <JWT>` and `x-portkey-config`.
+6. The gateway checks the JWT's signature against the IdP's public keys (JWKS) and its `exp`, without calling the IdP.
+7. The gateway routes the request by that config to the model provider.
+
 The gateway never talks to the IdP for a request. It checks the JWT's signature against the org's JWKS and its `exp`, so a token is good until it expires. Short tokens (minutes) and a helper that renews them are what make that safe.
 
 Why `apiKeyHelper`: Claude Code reads `ANTHROPIC_AUTH_TOKEN` from the environment once at launch, so a token put there dies with its `exp`. The helper's output is cached and re-read; Claude Code re-runs the helper ([docs](https://code.claude.com/docs/en/settings-reference#apikeyhelper)):
