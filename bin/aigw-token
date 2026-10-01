@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# aigw-token: print a short-lived IdP JWT for the AI Gateway. Made to be Claude Code's apiKeyHelper.
+#
+#   aigw-token            print an access token on stdout (cached, refreshed or re-minted as needed)
+#   aigw-token login      device flow only: show the sign-in URL and wait for approval
+#   aigw-token logout     revoke the refresh token at the IdP and delete the local cache
+#   aigw-token status     show the cached token's claims and expiry (never the token itself)
+#
+# Config (environment):
+#   AIGW_AUTH_MODE            device | client-credentials
+#   OIDC_ISSUER               issuer URL; endpoints come from $OIDC_ISSUER/.well-known/openid-configuration
+#   OIDC_CLIENT_ID            client id
+#   OIDC_SCOPE                scopes to request (optional), e.g. "completions.write"
+#   OIDC_CLIENT_SECRET_FILE   client-credentials only: file holding the client secret (trailing newline ignored)
+#   AIGW_TOKEN_CACHE          cache dir (default ${XDG_CACHE_HOME:-~/.cache}/aigw-token)
+#   AIGW_REFRESH_MARGIN       renew when the token has less than this many seconds left (default 60)
+#   AIGW_RETRY_WINDOW         a re-run within this many seconds of handing out a token means the gateway rejected it
+#                             (Claude Code re-runs the helper on 401/403): get a new one instead (default 5)
+#   AIGW_TOKEN_LOG            optional file: one line per run (what it did, never a token)
+#
+# Only the token goes to stdout. Messages go to stderr; Claude Code shows a failing helper's stderr in the session,
+# which is how the device-flow sign-in URL reaches the user.
+set -euo pipefail
+
+: "${AIGW_AUTH_MODE:?set AIGW_AUTH_MODE (device or client-credentials)}"
+: "${OIDC_ISSUER:?set OIDC_ISSUER}"
+: "${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID}"
+OIDC_SCOPE=${OIDC_SCOPE:-}
+CACHE_DIR=${AIGW_TOKEN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/aigw-token}
+MARGIN=${AIGW_REFRESH_MARGIN:-60}
+RETRY_WINDOW=${AIGW_RETRY_WINDOW:-5}
+KEY=$(printf '%s|%s|%s' "$OIDC_ISSUER" "$OIDC_CLIENT_ID" "$AIGW_AUTH_MODE" | cksum | cut -d' ' -f1)
+TOKENS="$CACHE_DIR/$KEY.json"    # {access_token, refresh_token, exp}
+PENDING="$CACHE_DIR/$KEY.pending.json"   # device flow in progress: {device_code, verifier, url, user_code, expires_at, interval, polled_at}
+SERVED="$CACHE_DIR/$KEY.served"   # mtime = when a token was last handed out
+NOW=$(date +%s)
+
+umask 077
+mkdir -p "$CACHE_DIR"
+
+log() { [ -z "${AIGW_TOKEN_LOG:-}" ] || printf '%s %s %s\n' "$(date -u +%FT%TZ)" "$AIGW_AUTH_MODE" "$*" >>"$AIGW_TOKEN_LOG"; }
+die() { echo "aigw-token: $*" >&2; log "error: $*"; exit 1; }
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+jwt_claims() { local p; p=$(cut -d. -f2 <<<"$1" | tr '_-' '/+'); while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done; base64 -d <<<"$p"; }
+
+discover() {  # discover <field> -> endpoint from the issuer's discovery document (cached for a day)
+  local doc="$CACHE_DIR/$KEY.discovery.json"
+  if [ ! -s "$doc" ] || [ $(( NOW - $(mtime "$doc") )) -gt 86400 ]; then
+    curl -sf "${OIDC_ISSUER%/}/.well-known/openid-configuration" -o "$doc.tmp" || die "can't read the discovery document of $OIDC_ISSUER"
+    mv "$doc.tmp" "$doc"
+  fi
+  jq -er --arg f "$1" '.[$f]' "$doc" || die "the IdP doesn't advertise $1"
+}
+
+token_post() {  # token_post <curl -d args...> -> token response JSON (stdout); HTTP errors are returned, not fatal
+  curl -s -X POST "$(discover token_endpoint)" -d "client_id=$OIDC_CLIENT_ID" "$@"
+}
+
+save() {  # save <token-response> : write the cache, keeping the old refresh token if the IdP didn't rotate it
+  local resp=$1 at exp old_rt=""
+  at=$(jq -r '.access_token // empty' <<<"$resp"); [ -n "$at" ] || return 1
+  exp=$(jwt_claims "$at" | jq -r '.exp // empty') || exp=""
+  [ -n "$exp" ] || exp=$(( NOW + $(jq -r '.expires_in // 300' <<<"$resp") ))
+  [ -f "$TOKENS" ] && old_rt=$(jq -r '.refresh_token // empty' "$TOKENS")
+  jq -n --argjson r "$resp" --argjson exp "$exp" --arg old "$old_rt" \
+    '{access_token: $r.access_token, refresh_token: ($r.refresh_token // (if $old == "" then null else $old end)), exp: $exp}' >"$TOKENS.tmp"
+  mv "$TOKENS.tmp" "$TOKENS"
+  printf '%s' "$at"
+}
+
+cached() {  # print the cached access token if it has more than MARGIN seconds left
+  [ -f "$TOKENS" ] || return 1
+  [ $(( $(jq -r '.exp // 0' "$TOKENS") - NOW )) -gt "$MARGIN" ] || return 1
+  jq -er '.access_token' "$TOKENS"
+}
+
+# --- client credentials: no refresh token, just mint a new access token -------------------------------------------
+client_credentials() {
+  : "${OIDC_CLIENT_SECRET_FILE:?set OIDC_CLIENT_SECRET_FILE}"
+  local resp
+  [ -r "$OIDC_CLIENT_SECRET_FILE" ] || die "can't read $OIDC_CLIENT_SECRET_FILE"
+  # the secret goes through stdin (not argv), without the file's trailing newline
+  resp=$(tr -d '\r\n' <"$OIDC_CLIENT_SECRET_FILE" | token_post -d grant_type=client_credentials \
+    --data-urlencode "client_secret@-" ${OIDC_SCOPE:+-d "scope=$OIDC_SCOPE"})
+  save "$resp" || die "client_credentials grant failed: $(jq -r '.error_description // .error // .' <<<"$resp")"
+  log "minted (client_credentials)"
+}
+
+# --- device flow (RFC 8628) with PKCE ------------------------------------------------------------------------------
+refresh() {  # silent renewal with the cached refresh token
+  local rt resp
+  rt=$([ -f "$TOKENS" ] && jq -r '.refresh_token // empty' "$TOKENS") || true
+  [ -n "$rt" ] || return 1
+  resp=$(printf '%s' "$rt" | token_post -d grant_type=refresh_token --data-urlencode "refresh_token@-")
+  if save "$resp" >/dev/null; then log "refreshed"; jq -r .access_token "$TOKENS"; return 0; fi
+  log "refresh rejected: $(jq -r '.error // .' <<<"$resp")"
+  return 1
+}
+
+device_start() {  # begin a device authorization and remember it; prints nothing on stdout
+  local verifier challenge resp
+  verifier=$(openssl rand 32 | b64url)
+  challenge=$(printf '%s' "$verifier" | openssl dgst -sha256 -binary | b64url)
+  resp=$(curl -s -X POST "$(discover device_authorization_endpoint)" -d "client_id=$OIDC_CLIENT_ID" \
+    -d "code_challenge=$challenge" -d code_challenge_method=S256 ${OIDC_SCOPE:+-d "scope=$OIDC_SCOPE"})
+  jq -e '.device_code' <<<"$resp" >/dev/null || die "device authorization failed: $(jq -r '.error_description // .error // .' <<<"$resp")"
+  jq -n --argjson r "$resp" --arg v "$verifier" --argjson now "$NOW" '{device_code: $r.device_code, verifier: $v,
+    url: ($r.verification_uri_complete // $r.verification_uri), user_code: $r.user_code,
+    expires_at: ($now + ($r.expires_in // 600)), interval: ($r.interval // 5), polled_at: $now}' >"$PENDING"
+  log "device flow started"
+}
+
+device_poll() {  # poll the pending authorization once. 0 = signed in (token on stdout), 2 = still waiting, 1 = gone
+  [ -f "$PENDING" ] || return 1
+  if [ "$(jq -r .expires_at "$PENDING")" -le "$NOW" ]; then rm -f "$PENDING"; return 1; fi
+  # The IdP answers slow_down to polls closer together than its interval, and Claude Code re-runs a failing helper every
+  # second or two: wait out the interval so the poll right after the user approves succeeds.
+  local resp err wait
+  wait=$(( $(jq -r '(.polled_at // 0) + (.interval // 5) + 1' "$PENDING") - NOW ))   # +1: clock granularity
+  if [ "$wait" -gt 0 ]; then sleep "$wait"; NOW=$(date +%s); fi
+  resp=$(token_post -d grant_type=urn:ietf:params:oauth:grant-type:device_code \
+    -d "device_code=$(jq -r .device_code "$PENDING")" -d "code_verifier=$(jq -r .verifier "$PENDING")")
+  if save "$resp"; then rm -f "$PENDING"; log "device flow completed"; return 0; fi
+  err=$(jq -r '.error // empty' <<<"$resp")
+  case $err in
+    authorization_pending|slow_down)
+      jq --argjson now "$(date +%s)" --arg err "$err" '.polled_at = $now | if $err == "slow_down" then .interval += 5 else . end' \
+        "$PENDING" >"$PENDING.tmp" && mv "$PENDING.tmp" "$PENDING"
+      log "device flow: $err"; return 2 ;;
+    *) rm -f "$PENDING"; return 1 ;;   # denied or expired
+  esac
+}
+
+device_prompt() {
+  printf 'Sign in to the AI Gateway: open %s and confirm code %s\n' "$(jq -r .url "$PENDING")" "$(jq -r .user_code "$PENDING")" >&2
+}
+
+device_token() {  # non-blocking, for apiKeyHelper: refresh, else finish or start a sign-in and fail with the URL
+  refresh && return 0
+  local rc=0; device_poll || rc=$?
+  [ $rc -eq 0 ] && return 0
+  [ $rc -eq 2 ] || device_start
+  device_prompt
+  echo "Then send your message again." >&2
+  exit 1
+}
+
+# --- commands --------------------------------------------------------------------------------------------------------
+cmd_token() {
+  if [ -f "$SERVED" ] && [ -f "$TOKENS" ] && [ $(( NOW - $(mtime "$SERVED") )) -lt "$RETRY_WINDOW" ]; then
+    log "re-run $(( NOW - $(mtime "$SERVED") ))s after handing out a token: assuming it was rejected"
+    jq '.exp = 0' "$TOKENS" >"$TOKENS.tmp" && mv "$TOKENS.tmp" "$TOKENS"   # drop the access token, keep the refresh token
+  fi
+  if cached; then log "cached"; else
+    case $AIGW_AUTH_MODE in
+      client-credentials) client_credentials ;;
+      device) device_token ;;
+      *) die "unknown AIGW_AUTH_MODE '$AIGW_AUTH_MODE'" ;;
+    esac
+  fi
+  touch "$SERVED"
+}
+
+cmd_login() {
+  [ "$AIGW_AUTH_MODE" = device ] || die "login is only for AIGW_AUTH_MODE=device"
+  { cached || refresh; } >/dev/null && { echo "Already signed in." >&2; return; }
+  local rc=0; device_poll >/dev/null || rc=$?
+  [ $rc -eq 0 ] && { echo "Signed in." >&2; return; }
+  [ $rc -eq 2 ] || device_start
+  device_prompt
+  while [ "$(jq -r .expires_at "$PENDING" 2>/dev/null || echo 0)" -gt "$(date +%s)" ]; do
+    NOW=$(date +%s); rc=0; device_poll >/dev/null || rc=$?   # device_poll waits out the poll interval
+    case $rc in 0) echo "Signed in." >&2; return ;; 1) die "sign-in was denied or expired" ;; esac
+  done
+  die "sign-in timed out"
+}
+
+cmd_logout() {
+  local rt endpoint
+  rt=$([ -f "$TOKENS" ] && jq -r '.refresh_token // empty' "$TOKENS") || true
+  if [ -n "$rt" ]; then
+    endpoint=$(discover revocation_endpoint 2>/dev/null) &&
+      printf '%s' "$rt" | curl -s -o /dev/null -X POST "$endpoint" -d "client_id=$OIDC_CLIENT_ID" --data-urlencode "token@-" \
+        -d token_type_hint=refresh_token && echo "Revoked the refresh token." >&2
+  fi
+  rm -f "$TOKENS" "$PENDING" "$SERVED"
+  log "logged out"
+  echo "Deleted the local token cache." >&2
+}
+
+cmd_status() {
+  [ -f "$TOKENS" ] || { echo "No cached token."; return; }
+  jwt_claims "$(jq -r .access_token "$TOKENS")" | jq --argjson now "$NOW" \
+    '{iss, sub, email_id, email, scope, portkey_oid, portkey_workspace, defaults, expires_in: (.exp - $now)}'
+  jq '{refresh_token: (if .refresh_token then "cached" else "none" end)}' "$TOKENS"
+}
+
+case ${1:-token} in
+  token) cmd_token ;;
+  login) cmd_login ;;
+  logout) cmd_logout ;;
+  status) cmd_status ;;
+  *) echo "usage: aigw-token [token|login|logout|status]" >&2; exit 2 ;;
+esac

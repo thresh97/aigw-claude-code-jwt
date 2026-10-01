@@ -1,0 +1,5 @@
+CLAUDE.local.md
+HANDOFF.md
+.env
+*.secret
+*.local.json
