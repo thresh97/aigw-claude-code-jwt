@@ -1,17 +1,13 @@
 # aigw-claude-code-jwt
 
-Claude Code through a **hybrid** Prisma AIRS / Portkey AI Gateway, authenticated with **short-lived JWTs from your own
-identity provider** (IdP) instead of a static gateway key. Claude Code's `apiKeyHelper` runs [`bin/aigw-token`](bin/aigw-token),
-which hands Claude Code a valid token and renews it in the middle of a session. Two ways to get the token:
+Claude Code through a **hybrid** Prisma AIRS / Portkey AI Gateway, authenticated with **short-lived JWTs from your own identity provider** (IdP) instead of a static gateway key. Claude Code's `apiKeyHelper` runs [`bin/aigw-token`](bin/aigw-token), which hands Claude Code a valid token and renews it in the middle of a session. Two ways to get the token:
 
 | Path | Who | Grant | Renewal |
 |---|---|---|---|
 | **Per user** | a developer at a laptop | OAuth device authorization (RFC 8628) with PKCE, one browser sign-in | refresh token, silent |
 | **Shared** | a CI runner, a VM, a shared service | OAuth client credentials (client id + secret file) | mint a new token |
 
-> **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or
-> Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at
-> your own risk, under the [MIT License](LICENSE).
+> **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
 
 ```
                   ┌──────────── IdP (OIDC) ────────────┐
@@ -24,33 +20,22 @@ Claude Code ── apiKeyHelper ── bin/aigw-token     AI Gateway (hybrid, JW
          x-portkey-config: <slug>  ◄── the JWT's defaults.config_id, copied into Claude Code's settings by the helper
 ```
 
-The gateway never talks to the IdP for a request. It checks the JWT's signature against the org's JWKS and its `exp`, so a
-token is good until it expires. Short tokens (minutes) and a helper that renews them are what make that safe.
+The gateway never talks to the IdP for a request. It checks the JWT's signature against the org's JWKS and its `exp`, so a token is good until it expires. Short tokens (minutes) and a helper that renews them are what make that safe.
 
-Why `apiKeyHelper`: Claude Code reads `ANTHROPIC_AUTH_TOKEN` from the environment once at launch, so a token put there dies
-with its `exp`. The helper's output is cached and re-read; Claude Code re-runs the helper
-([docs](https://code.claude.com/docs/en/settings-reference#apikeyhelper)):
+Why `apiKeyHelper`: Claude Code reads `ANTHROPIC_AUTH_TOKEN` from the environment once at launch, so a token put there dies with its `exp`. The helper's output is cached and re-read; Claude Code re-runs the helper ([docs](https://code.claude.com/docs/en/settings-reference#apikeyhelper)):
 
 - every 5 minutes (`CLAUDE_CODE_API_KEY_HELPER_TTL_MS`),
 - when a request fails with `401` or `403`,
 - before a request, when the cached output is a JWT that has expired (Claude Code v2.1.246 or later).
 
-The last two only apply when `ANTHROPIC_AUTH_TOKEN` isn't set. The helper's output is sent as both `X-Api-Key` and
-`Authorization: Bearer`. Note that `apiKeyHelper` replaces Claude subscription login; for keeping subscription (SSO) auth
-through the gateway see [aigw-passthrough-fallback](https://github.com/thresh97/aigw-passthrough-fallback).
+The last two only apply when `ANTHROPIC_AUTH_TOKEN` isn't set. The helper's output is sent as both `X-Api-Key` and `Authorization: Bearer`. Note that `apiKeyHelper` replaces Claude subscription login; for keeping subscription (SSO) auth through the gateway see [aigw-passthrough-fallback](https://github.com/thresh97/aigw-passthrough-fallback).
 
-Which gateway config a request uses comes from the IdP too: the token carries it in a `defaults.config_id` claim. The
-gateway ignored that claim in testing (see [Findings](#findings)), so the helper copies it into Claude Code's settings as
-the `x-portkey-config` header. Change the claim at the IdP and users move to the new config at their next token renewal,
-without touching their settings.
+Which gateway config a request uses comes from the IdP too: the token carries it in a `defaults.config_id` claim. The gateway ignored that claim in testing (see [Findings](#findings)), so the helper copies it into Claude Code's settings as the `x-portkey-config` header. Change the claim at the IdP and users move to the new config at their next token renewal, without touching their settings.
 
 ## What you need
 
-- A **hybrid** AI Gateway with gateway-local JWT auth (section 1), and a network path from the client to it. For a private
-  (VPC-internal) gateway, e.g. `ssh -N -L 18080:<internal-gateway-lb>:80 <host-in-the-vpc>`.
-- An OIDC IdP that signs access tokens with **RS256 and a `kid`**, publishes a JWKS URL, and supports the device
-  authorization grant (per-user path) and/or client credentials (shared path). Keycloak is used here; Okta, Entra ID, Auth0
-  and others have the same grants.
+- A **hybrid** AI Gateway with gateway-local JWT auth (section 1), and a network path from the client to it. For a private (VPC-internal) gateway, e.g. `ssh -N -L 18080:<internal-gateway-lb>:80 <host-in-the-vpc>`.
+- An OIDC IdP that signs access tokens with **RS256 and a `kid`**, publishes a JWKS URL, and supports the device authorization grant (per-user path) and/or client credentials (shared path). Keycloak is used here; Okta, Entra ID, Auth0 and others have the same grants.
 - A workspace with a provider that serves Claude, and the model IDs it serves.
 - [`airs-cli`](https://www.npmjs.com/package/@cdot65/prisma-airs-cli) with a tenant selected and rights to read org auth
   settings and deployments, create configs in the workspace and read its logs.
@@ -78,8 +63,7 @@ Gateway-local JWT auth is set on the hybrid gateway's environment (see Portkey's
 | `ORGANISATIONS_TO_SYNC` | one org UUID | With a single org, tokens don't need `portkey_oid`. |
 | `JWT_LOCAL_AUTH_DEFAULT_SCOPES` | e.g. `completions.write` | Only if your IdP can't put a gateway scope in the token. |
 
-The workspace comes from the token's `portkey_workspace` if it has one, else from the deployment's workspace allowlist (the
-first entry), else the org default workspace. And the org needs the IdP's JWKS URL:
+The workspace comes from the token's `portkey_workspace` if it has one, else from the deployment's workspace allowlist (the first entry), else the org default workspace. And the org needs the IdP's JWKS URL:
 
 ```bash
 # Org JWKS URL (Keycloak: $OIDC_ISSUER/protocol/openid-connect/certs). Set it in Strata Cloud Manager under the AI Gateway
@@ -90,11 +74,9 @@ airs-cli --quiet aigateway organisations auth-settings get --tsg-id "$TSG" --out
 airs-cli --quiet aigateway deployments get <deployment-id> --output json | jq .auth_settings
 ```
 
-`auth-settings update` exists too, but the org setting is shared by every gateway and project in the org, so it wasn't
-changed in testing.
+`auth-settings update` exists too, but the org setting is shared by every gateway and project in the org, so it wasn't changed in testing.
 
-A routing config. The request has to name one (or a provider) with `x-portkey-config` (see Findings). Its slug goes in the
-tokens (section 2):
+A routing config. The request has to name one (or a provider) with `x-portkey-config` (see Findings). Its slug goes in the tokens (section 2):
 
 ```bash
 CFG=$(airs-cli --quiet aigateway configs create --workspace "$WS_ID" --name claude-code-jwt \
@@ -120,8 +102,7 @@ What the gateway needs in the access token:
 Two clients:
 
 - **Per user**: a public client (no secret) with the device authorization grant on and PKCE (S256).
-- **Shared**: a confidential client with client credentials ("service account") on. Its secret goes in a file only the
-  service can read.
+- **Shared**: a confidential client with client credentials ("service account") on. Its secret goes in a file only the service can read.
 
 Keycloak example, with the admin REST API (`$KC` is the base URL including `/auth` if your Keycloak uses it):
 
@@ -161,18 +142,13 @@ done
 (umask 077; kc GET "/clients/$(client_id $SVC_CLIENT)/client-secret" | jq -r .value > aigw-svc.secret)
 ```
 
-Keycloak shows a consent screen ("Grant access to …") after a device sign-in. The refresh token lives as long as the user's
-SSO session: **SSO Session Idle** (default 30 minutes) and **SSO Session Max** in the realm settings. When it runs out, the
-next renewal asks the user to sign in again.
+Keycloak shows a consent screen ("Grant access to …") after a device sign-in. The refresh token lives as long as the user's SSO session: **SSO Session Idle** (default 30 minutes) and **SSO Session Max** in the realm settings. When it runs out, the next renewal asks the user to sign in again.
 
-A hardcoded claim gives every token from these clients the same config. For different configs per team, use one client
-(or client scope) per team, or a mapper that takes the value from the user; the helper only reads the claim. Only the
-hardcoded mapper was tested.
+A hardcoded claim gives every token from these clients the same config. For different configs per team, use one client (or client scope) per team, or a mapper that takes the value from the user; the helper only reads the claim. Only the hardcoded mapper was tested.
 
 ## 3. The helper
 
-[`bin/aigw-token`](bin/aigw-token) prints a token on stdout and nothing else. Messages go to stderr; Claude Code shows a failing
-helper's stderr in the session, which is how a device sign-in link reaches the user.
+[`bin/aigw-token`](bin/aigw-token) prints a token on stdout and nothing else. Messages go to stderr; Claude Code shows a failing helper's stderr in the session, which is how a device sign-in link reaches the user.
 
 ```
 aigw-token            print an access token (cached, refreshed or re-minted as needed)
@@ -200,29 +176,15 @@ What a run does:
 
 1. A cached access token with more than `AIGW_REFRESH_MARGIN` left: print it.
 2. Client credentials: get a new token with the secret.
-3. Device: use the refresh token. If that fails (expired or revoked session), check a pending sign-in. If there's none,
-   start one. Either way, print "Sign in to the AI Gateway: open <url> and confirm code <code>" to stderr and exit 1. The
-   helper never blocks waiting for the browser; the next run (the user's next message) picks up the approved sign-in.
-   Polls are spaced by the IdP's interval (5 s by default; it answers `slow_down` to faster polls), so a run may wait up to
-   that long.
+3. Device: use the refresh token. If that fails (expired or revoked session), check a pending sign-in. If there's none, start one. Either way, print "Sign in to the AI Gateway: open <url> and confirm code <code>" to stderr and exit 1. The helper never blocks waiting for the browser; the next run (the user's next message) picks up the approved sign-in.
+   Polls are spaced by the IdP's interval (5 s by default; it answers `slow_down` to faster polls), so a run may wait up to that long.
 
-The retry window exists because Claude Code re-runs the helper after a `401`/`403`, but doesn't say why. Without it, a
-cached token the gateway rejects before it expires (key rotation, revoked session) would be handed out again on every retry.
-Claude Code's own retries come 1–2 seconds apart, so a quick re-run means "rejected": the helper drops the cached access
-token and refreshes or mints. The cost is one extra renewal when two Claude Code processes start within the window.
+The retry window exists because Claude Code re-runs the helper after a `401`/`403`, but doesn't say why. Without it, a cached token the gateway rejects before it expires (key rotation, revoked session) would be handed out again on every retry.  Claude Code's own retries come 1–2 seconds apart, so a quick re-run means "rejected": the helper drops the cached access token and refreshes or mints. The cost is one extra renewal when two Claude Code processes start within the window.
 
-**Config from the token.** With `AIGW_CLAUDE_SETTINGS` set, each time the helper hands out a token it reads the token's
-`defaults.config_id` and makes sure the settings file's `env.ANTHROPIC_CUSTOM_HEADERS` has `x-portkey-config: <that slug>`.
-Other headers in it are kept, the file is only written when the value changes, and its owner and mode are kept. Claude Code
-watches its settings files and picks up the new header without a restart:
+**Config from the token.** With `AIGW_CLAUDE_SETTINGS` set, each time the helper hands out a token it reads the token's `defaults.config_id` and makes sure the settings file's  `env.ANTHROPIC_CUSTOM_HEADERS` has `x-portkey-config: <that slug>`. Other headers in it are kept, the file is only written when the value changes, and its owner and mode are kept. Claude Code watches its settings files and picks up the new header without a restart:
 
-- **First session, no header yet**: the helper writes it and then waits `AIGW_SETTINGS_SETTLE` seconds so Claude Code
-  reloads before it sends the request. Without the wait the first request went out without the header and got a `400`;
-  with 2 or 3 seconds, 10 of 10 first runs worked. Running `aigw-token config` (shared) or `aigw-token login` (per user)
-  once at install writes the header ahead of time.
-- **Claim changed at the IdP**: the helper writes the new slug at the next token renewal. Claude Code had already built
-  the request that triggered the renewal, so that one request still used the old config, and the ones after it used the new
-  one.
+- **First session, no header yet**: the helper writes it and then waits `AIGW_SETTINGS_SETTLE` seconds so Claude Code reloads before it sends the request. Without the wait the first request went out without the header and got a `400`; with 2 or 3 seconds, 10 of 10 first runs worked. Running `aigw-token config` (shared) or `aigw-token login` (per user) once at install writes the header ahead of time.
+- **Claim changed at the IdP**: the helper writes the new slug at the next token renewal. Claude Code had already built the request that triggered the renewal, so that one request still used the old config, and the ones after it used the new one.
 
 A slug with characters other than letters, digits, `-` and `_` is ignored. A token without the claim leaves the file alone.
 
